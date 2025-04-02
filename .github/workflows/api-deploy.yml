@@ -1,0 +1,127 @@
+# This workflow build and push a Docker container to Google Artifact Registry
+# and deploy it on Cloud Run when a commit is pushed to the "main"
+# branch.
+#
+# To configure this workflow:
+#
+# 1. Enable the following Google Cloud APIs:
+#
+#    - Artifact Registry (artifactregistry.googleapis.com)
+#    - Cloud Run (run.googleapis.com)
+#    - IAM Credentials API (iamcredentials.googleapis.com)
+#
+#    You can learn more about enabling APIs at
+#    https://support.google.com/googleapi/answer/6158841.
+#
+# 2. Create and configure a Workload Identity Provider for GitHub:
+#    https://github.com/google-github-actions/auth#preferred-direct-workload-identity-federation.
+#
+#    Depending on how you authenticate, you will need to grant an IAM principal
+#    permissions on Google Cloud:
+#
+#    - Artifact Registry Administrator (roles/artifactregistry.admin)
+#    - Cloud Run Developer (roles/run.developer)
+#
+#    You can learn more about setting IAM permissions at
+#    https://cloud.google.com/iam/docs/manage-access-other-resources
+#
+# 3. Change the values in the "env" block to match your values.
+
+
+name: deploy backend
+on:
+    push:
+        branches:
+            - main
+
+env:
+  PROJECT_ID: 'justdrive-424205' # Google Cloud project ID
+  REGION: 'asia-southeast1' # region
+  SERVICE: 'is215-clustering' # service name
+  WORKLOAD_IDENTITY_PROVIDER: 'projects/392732146202/locations/global/workloadIdentityPools/github/providers/my-repo' # justdrive gcloud workload identity provider
+  
+
+jobs:
+
+    deploy_backend:
+        name: Deploy Backend
+        runs-on: ubuntu-latest
+        if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true)
+
+        permissions:
+            contents: read
+            id-token: write
+
+        steps:
+            - name: 'Checkout'
+              uses: 'actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332' # actions/checkout@v4
+          
+            # Configure Workload Identity Federation and generate an access token.
+            #
+            # See https://github.com/google-github-actions/auth for more options,
+            # including authenticating via a JSON credentials file.
+            - id: 'auth'
+              name: 'Authenticate to Google Cloud'
+              uses: 'google-github-actions/auth@f112390a2df9932162083945e46d439060d66ec2' # google-github-actions/auth@v2
+              with:
+                workload_identity_provider: '${{ env.WORKLOAD_IDENTITY_PROVIDER }}'
+            
+            # BEGIN - Docker auth and build
+            #
+            # If you already have a container image, you can omit these steps.
+            - name: 'Docker Auth'
+              uses: 'docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567' # docker/login-action@v3
+              with:
+                username: 'oauth2accesstoken'
+                password: '${{ steps.auth.outputs.auth_token }}'
+                registry: '${{ env.REGION }}-docker.pkg.dev'
+          
+            - name: 'Build and Push Container'
+              run: |-
+                cd backend
+                DOCKER_TAG="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.SERVICE }}/${{ env.SERVICE }}:${{ github.sha }}"
+                docker build --tag "${DOCKER_TAG}" .
+                docker push "${DOCKER_TAG}"
+            - name: 'Deploy to Cloud Run'
+          
+              # END - Docker auth and build
+          
+              uses: 'google-github-actions/deploy-cloudrun@33553064113a37d688aa6937bacbdc481580be17' # google-github-actions/deploy-cloudrun@v2
+              with:
+                project_id: '${{ env.PROJECT_ID }}'
+                service: '${{ env.SERVICE }}'
+                region: '${{ env.REGION }}'
+                # NOTE: If using a pre-built image, update the image name below:
+          
+                image: '${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.SERVICE }}/${{ env.SERVICE }}:${{ github.sha }}'
+            # If required, use the Cloud Run URL output in later steps
+            - name: 'Show output'
+              run: |2-
+          
+                echo ${{ steps.deploy.outputs.url }}
+    
+    Telegram_Deployment_Notification_Website:
+        runs-on: ubuntu-latest
+        needs: [deploy_backend]
+        if: always()
+        steps:
+            - name: Check deployment status and send Telegram message
+              run: |
+                if [[ "${{ needs.deploy_backend.result }}" == "success" ]]; then
+                  MESSAGE="*\`JustDrive Backend\` deployment to* \`Google Cloud\` *successful✅*%0A%0A\`${{ github.repository }}\`"
+                else
+                  MESSAGE="*\`JustDrive Backend\` deployment to* \`Google Cloud\` *failed❌*%0A%0A\`${{ github.repository }}\`"
+                fi
+                
+                # Debug: Print the message to be sent
+                echo "Deployment status: ${{ needs.deploy_backend.result }}"
+                echo "Message to be sent: $MESSAGE"
+                
+                curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage \
+                  -d chat_id=${{ secrets.TELEGRAM_GROUP_ID }} \
+                  -d text="$MESSAGE" \
+                  -d parse_mode="MarkdownV2" \
+                  -d disable_web_page_preview=true \
+                  -d message_thread_id=${{ secrets.TELEGRAM_TOPIC_ID }}
+        
+
